@@ -1,0 +1,42 @@
+{
+  "Version": "1.0.0",
+  "Author": "Herdr",
+  "Name": "Herdr AI Sessions",
+  "Description": "Monitor live Herdr AI sessions and focus them from Ulanzi Deck.",
+  "Icon": "assets/icons/plugin.svg",
+  "Category": "Herdr",
+  "CategoryIcon": "assets/icons/category.svg",
+  "CodePath": "plugin/app.js",
+  "Type": "JavaScript",
+  "SupportedInMultiActions": false,
+  "UUID": "com.herdr.ulanzistudio.sessions",
+  "Actions": [
+    {
+      "Name": "AI Session Slot",
+      "Icon": "assets/icons/slot.svg",
+      "Tooltip": "Displays a live Herdr AI session and focuses it on press",
+      "UUID": "com.herdr.ulanzistudio.sessions.slot",
+      "SupportedInMultiActions": false,
+      "Controllers": ["Keypad"],
+      "state": 0,
+      "States": [
+        {
+          "Image": "assets/icons/slot.svg"
+        }
+      ]
+    }
+  ],
+  "OS": [
+    {
+      "Platform": "windows",
+      "MinimumVersion": "10"
+    },
+    {
+      "Platform": "mac",
+      "MinimumVersion": "10.11"
+    }
+  ],
+  "Software": {
+    "MinVersion": "2.1.4"
+  }
+}

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144">
+  <rect width="144" height="144" rx="24" fill="#0F172A"/>
+  <rect x="8" y="8" width="128" height="128" rx="18" fill="none" stroke="#3B82F6" stroke-width="4"/>
+  <circle cx="44" cy="48" r="10" fill="#10B981"/>
+  <circle cx="100" cy="48" r="10" fill="#F59E0B"/>
+  <text x="72" y="102" font-family="Segoe UI, Arial, sans-serif" font-size="28" font-weight="700" fill="#F8FAFC" text-anchor="middle">HERDR</text>
+</svg>
