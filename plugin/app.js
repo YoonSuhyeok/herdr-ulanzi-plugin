@@ -1,4 +1,6 @@
 import { execFile } from 'child_process';
+import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { promisify } from 'util';
@@ -18,6 +20,21 @@ const PLUGIN_UUID = 'com.herdr.ulanzistudio.sessions';
 const POLL_INTERVAL_MS = 1500;
 const LAYOUT_POLL_INTERVAL_MS = 3000;
 const MAX_RECENT_SPACES = 3;
+const RECENT_SPACES_FILE = path.join(
+  process.env.LOCALAPPDATA || os.tmpdir(),
+  'herdr',
+  'ulanzi-recent-spaces.json'
+);
+const RECENT_PANES_FILE = path.join(
+  process.env.LOCALAPPDATA || os.tmpdir(),
+  'herdr',
+  'ulanzi-recent-panes.json'
+);
+const DISMISSED_RECENT_FILE = path.join(
+  process.env.LOCALAPPDATA || os.tmpdir(),
+  'herdr',
+  'ulanzi-dismissed-recent.json'
+);
 
 const STATUS_PRIORITY = {
   blocked: 0,
@@ -38,8 +55,23 @@ const layoutByTerminal = new Map();
 /** @type {Map<string, { id: string, name: string, folder: string, machine: string | null }>} */
 let lastOpenSpaces = new Map();
 
+/** @type {Map<string, { id: string, spaceId: string, spaceName: string, tabName: string, paneIndex: number, agentName: string, folder: string, machine: string | null }>} */
+let lastOpenPanes = new Map();
+
+/** @type {Array<{ kind?: string, name: string, folder: string, machine: string | null }>} */
+let rememberedClosedSpaces = loadJsonArray(RECENT_SPACES_FILE);
+
+/** @type {Array<{ kind: string, id: string, spaceId: string, spaceName: string, tabName: string, paneIndex: number, agentName: string, folder: string, machine: string | null }>} */
+let rememberedClosedPanes = loadJsonArray(RECENT_PANES_FILE);
+
+/** @type {Set<string>} */
+let dismissedRecentKeys = new Set(loadJsonArray(DISMISSED_RECENT_FILE, 50));
+
 /** @type {Array<{ name: string, folder: string, machine: string | null }>} */
-let rememberedClosedSpaces = [];
+let apiRecentSpaces = [];
+
+/** @type {Array<{ name: string, folder: string, machine: string | null }>} */
+let finishedTerminalSpaces = [];
 
 /** @type {Array<{ name: string, folder: string, machine: string | null }>} */
 let recentSpaces = [];
@@ -93,6 +125,7 @@ function normalizeTerminal(t) {
     name,
     status,
     where,
+    cwd: rawCwd,
     spaceName: layout?.spaceName || '',
     tabName: layout?.tabName || '',
     paneIndex: layout?.paneIndex || null,
@@ -100,13 +133,130 @@ function normalizeTerminal(t) {
   };
 }
 
+function loadJsonArray(filePath, limit = 6) {
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.slice(0, limit) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveJsonArray(filePath, items) {
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, JSON.stringify(items, null, 2), 'utf8');
+  } catch {
+    // Ignore persistence failures
+  }
+}
+
 function spaceKey(space) {
-  return `${space.machine || 'local'}::${space.folder || space.name || ''}`;
+  const folder = String(space.folder || space.name || '').toLowerCase();
+  return `${space.machine || 'local'}::${folder}`;
+}
+
+function paneItemKey(item) {
+  if (item.kind === 'pane') {
+    const folder = String(item.folder || item.spaceName || '').toLowerCase();
+    const agent = String(item.agentName || '').toLowerCase();
+    const pos = item.tabName && item.paneIndex ? `${item.tabName}:${item.paneIndex}` : '';
+    return `pane::${item.machine || 'local'}::${folder}::${agent}::${pos}`;
+  }
+  return `space::${spaceKey(item)}`;
+}
+
+function parseTerminalNum(id) {
+  const m = String(id || '').match(/\d+/);
+  return m ? Number(m[0]) : 0;
+}
+
+function normalizeFinishedSpace(t) {
+  const folder = t.cwd || t.foreground?.cwd || '';
+  const whereSpace = t.where ? String(t.where).split(' / ')[0].trim() : '';
+  const name =
+    whereSpace && whereSpace !== '~'
+      ? whereSpace
+      : folder
+        ? path.basename(folder)
+        : t.address || t.id || '';
+  if (!name && !folder) return null;
+  const agentName = getAgentDisplayName(t, null, t.address || t.id || '');
+  return {
+    kind: 'pane',
+    id: t.address || t.id || '',
+    name,
+    spaceName: name,
+    agentName: agentName !== (t.address || t.id) ? agentName : '',
+    folder,
+    machine: t.machine || null,
+  };
+}
+
+function rebuildRecentSpaces(liveTerminals = []) {
+  const openSpaceKeys = new Set();
+  for (const space of lastOpenSpaces.values()) {
+    openSpaceKeys.add(spaceKey(space));
+  }
+  for (const term of liveTerminals) {
+    if (term.cwd) {
+      openSpaceKeys.add(spaceKey({ folder: term.cwd, machine: null }));
+    }
+  }
+
+  const seenItems = new Set();
+  const combined = [];
+
+  for (const pane of rememberedClosedPanes) {
+    if (!pane || typeof pane !== 'object') continue;
+    const key = paneItemKey({ ...pane, kind: 'pane' });
+    if (seenItems.has(key)) continue;
+    seenItems.add(key);
+    combined.push({ ...pane, kind: 'pane' });
+    if (combined.length >= MAX_RECENT_SPACES) {
+      recentSpaces = combined;
+      return;
+    }
+  }
+
+  for (const item of [...rememberedClosedSpaces, ...apiRecentSpaces]) {
+    if (!item || typeof item !== 'object') continue;
+    const candidate = {
+      kind: 'space',
+      name: item.name || (item.folder ? path.basename(item.folder) : ''),
+      folder: item.folder || '',
+      machine: item.machine || null,
+    };
+    if (!candidate.name && !candidate.folder) continue;
+    if (openSpaceKeys.has(spaceKey(candidate))) continue;
+    const key = paneItemKey(candidate);
+    if (seenItems.has(key)) continue;
+    seenItems.add(key);
+    combined.push(candidate);
+    if (combined.length >= MAX_RECENT_SPACES) {
+      recentSpaces = combined;
+      return;
+    }
+  }
+
+  for (const item of finishedTerminalSpaces) {
+    if (!item || typeof item !== 'object') continue;
+    const key = paneItemKey(item);
+    if (dismissedRecentKeys.has(key) || seenItems.has(key)) continue;
+    seenItems.add(key);
+    combined.push(item);
+    if (combined.length >= MAX_RECENT_SPACES) break;
+  }
+
+  recentSpaces = combined;
 }
 
 function updateRecentSpaces(data) {
   const currentOpen = new Map();
-  const openKeys = new Set();
+  const currentPanes = new Map();
+  let spacesChanged = false;
+  let panesChanged = false;
 
   for (const space of data.spaces || []) {
     const entry = {
@@ -116,9 +266,28 @@ function updateRecentSpaces(data) {
       machine: space.machine || null,
     };
     if (entry.id) currentOpen.set(entry.id, entry);
-    openKeys.add(spaceKey(entry));
+
+    for (const tab of space.tabs || []) {
+      const tabName = tab.name || '';
+      const termList = Array.isArray(tab.terminals) ? tab.terminals : [];
+      termList.forEach((term, idx) => {
+        if (!term.terminal) return;
+        currentPanes.set(term.terminal, {
+          kind: 'pane',
+          id: term.terminal,
+          spaceId: entry.id,
+          spaceName: entry.name || (entry.folder ? path.basename(entry.folder) : ''),
+          tabName,
+          paneIndex: idx + 1,
+          agentName: term.name || term.app || '',
+          folder: entry.folder,
+          machine: entry.machine,
+        });
+      });
+    }
   }
 
+  let dismissedChanged = false;
   for (const [id, prev] of lastOpenSpaces.entries()) {
     if (!currentOpen.has(id) && (prev.folder || prev.name)) {
       const key = spaceKey(prev);
@@ -126,29 +295,32 @@ function updateRecentSpaces(data) {
         { name: prev.name, folder: prev.folder, machine: prev.machine },
         ...rememberedClosedSpaces.filter((s) => spaceKey(s) !== key),
       ].slice(0, 6);
+      spacesChanged = true;
     }
   }
-  lastOpenSpaces = currentOpen;
 
-  const combined = [];
-  const seen = new Set(openKeys);
-
-  for (const item of [...rememberedClosedSpaces, ...(Array.isArray(data.recent) ? data.recent : [])]) {
-    if (!item || typeof item !== 'object') continue;
-    const candidate = {
-      name: item.name || (item.folder ? path.basename(item.folder) : ''),
-      folder: item.folder || '',
-      machine: item.machine || null,
-    };
-    if (!candidate.name && !candidate.folder) continue;
-    const key = spaceKey(candidate);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    combined.push(candidate);
-    if (combined.length >= MAX_RECENT_SPACES) break;
+  for (const [id, prev] of lastOpenPanes.entries()) {
+    if (!currentPanes.has(id) && currentOpen.has(prev.spaceId)) {
+      const key = paneItemKey(prev);
+      const finishedKey = paneItemKey({ ...prev, tabName: '', paneIndex: null });
+      if (dismissedRecentKeys.delete(key)) dismissedChanged = true;
+      if (dismissedRecentKeys.delete(finishedKey)) dismissedChanged = true;
+      rememberedClosedPanes = [
+        prev,
+        ...rememberedClosedPanes.filter((p) => paneItemKey(p) !== key),
+      ].slice(0, 6);
+      panesChanged = true;
+    }
   }
 
-  recentSpaces = combined;
+  lastOpenSpaces = currentOpen;
+  lastOpenPanes = currentPanes;
+  if (spacesChanged) saveJsonArray(RECENT_SPACES_FILE, rememberedClosedSpaces);
+  if (panesChanged) saveJsonArray(RECENT_PANES_FILE, rememberedClosedPanes);
+  if (dismissedChanged) saveJsonArray(DISMISSED_RECENT_FILE, Array.from(dismissedRecentKeys));
+
+  apiRecentSpaces = Array.isArray(data.recent) ? data.recent : [];
+  rebuildRecentSpaces();
 }
 
 async function refreshLayout() {
@@ -200,7 +372,7 @@ async function refreshLayout() {
 }
 
 async function fetchTerminals() {
-  const { stdout } = await execFileAsync('hc', ['ls', '--json'], {
+  const { stdout } = await execFileAsync('hc', ['ls', '--all', '--json'], {
     timeout: 3000,
     windowsHide: true,
     maxBuffer: 1024 * 1024,
@@ -213,7 +385,8 @@ async function fetchTerminals() {
       ? parsed.terminals
       : [];
 
-  return list
+  const live = list
+    .filter((t) => String(t.state || '').toLowerCase() !== 'finished')
     .map(normalizeTerminal)
     .filter((t) => Boolean(t.id))
     .sort((a, b) => {
@@ -222,6 +395,14 @@ async function fetchTerminals() {
       if (pa !== pb) return pa - pb;
       return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
     });
+
+  finishedTerminalSpaces = list
+    .filter((t) => String(t.state || '').toLowerCase() === 'finished')
+    .sort((a, b) => parseTerminalNum(b.address || b.id) - parseTerminalNum(a.address || a.id))
+    .map(normalizeFinishedSpace)
+    .filter(Boolean);
+
+  return live;
 }
 
 function getOrderedSlots() {
@@ -242,6 +423,7 @@ async function refreshAllSlots() {
 
   try {
     const terminals = await fetchTerminals();
+    rebuildRecentSpaces(terminals);
     const ordered = getOrderedSlots();
 
     ordered.forEach((slot, index) => {
@@ -325,17 +507,57 @@ async function focusTerminal(terminal) {
   }
 }
 
-async function reopenSpace(space) {
-  try {
-    const args = ['do', 'space.new'];
-    if (space.name) args.push('--name', space.name);
-    if (space.folder) args.push('--folder', space.folder);
-    if (space.machine) args.push('--machine', space.machine);
+function consumeRecentItem(item) {
+  const targetPaneKey = paneItemKey(item);
+  const targetFinishedKey = paneItemKey({ ...item, kind: 'pane', tabName: '', paneIndex: null });
+  const targetSpaceKey = spaceKey(item);
 
-    await execFileAsync('herdr-app', args, {
-      timeout: 4000,
-      windowsHide: true,
-    });
+  const nextPanes = rememberedClosedPanes.filter((p) => paneItemKey(p) !== targetPaneKey);
+  if (nextPanes.length !== rememberedClosedPanes.length) {
+    rememberedClosedPanes = nextPanes;
+    saveJsonArray(RECENT_PANES_FILE, rememberedClosedPanes);
+  }
+
+  const nextSpaces = rememberedClosedSpaces.filter((s) => spaceKey(s) !== targetSpaceKey);
+  if (nextSpaces.length !== rememberedClosedSpaces.length) {
+    rememberedClosedSpaces = nextSpaces;
+    saveJsonArray(RECENT_SPACES_FILE, rememberedClosedSpaces);
+  }
+
+  dismissedRecentKeys.add(targetPaneKey);
+  dismissedRecentKeys.add(targetFinishedKey);
+  saveJsonArray(DISMISSED_RECENT_FILE, Array.from(dismissedRecentKeys).slice(-50));
+}
+
+async function reopenSpace(item) {
+  try {
+    const openSpace =
+      (item.spaceId && lastOpenSpaces.get(item.spaceId)) ||
+      Array.from(lastOpenSpaces.values()).find(
+        (s) => item.folder && s.folder && s.folder.toLowerCase() === item.folder.toLowerCase()
+      );
+
+    if (item.kind === 'pane' && openSpace?.id) {
+      const args = ['do', 'tab.new', '--space', openSpace.id];
+      if (item.folder) args.push('--folder', item.folder);
+      await execFileAsync('herdr-app', args, {
+        timeout: 4000,
+        windowsHide: true,
+      });
+    } else {
+      const args = ['do', 'space.new'];
+      const spaceName = item.spaceName || item.name;
+      if (spaceName) args.push('--name', spaceName);
+      if (item.folder) args.push('--folder', item.folder);
+      if (item.machine) args.push('--machine', item.machine);
+
+      await execFileAsync('herdr-app', args, {
+        timeout: 4000,
+        windowsHide: true,
+      });
+    }
+
+    consumeRecentItem(item);
     await activateHerdrWindow();
     await refreshLayout();
     await refreshAllSlots();

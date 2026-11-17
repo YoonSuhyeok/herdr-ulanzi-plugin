@@ -93,19 +93,36 @@ export function renderSessionIcon(session) {
   return toDataUrl(svg);
 }
 
-export function renderRecentSpaceIcon(space) {
-  const spaceTitle = escapeXml(truncate(space.name || 'Space', 13));
-  const folderHint = escapeXml(truncate(space.folder ? space.folder.split(/[\\/]/).filter(Boolean).pop() : 'Reopen', 16));
+export function renderRecentSpaceIcon(item) {
+  const spaceTitle = escapeXml(truncate(item.spaceName || item.name || 'Space', 13));
+  const folderName = item.folder ? item.folder.split(/[\\/]/).filter(Boolean).pop() : '';
+  const hasPanePos = Boolean(item.tabName && item.paneIndex);
+  const middleText = escapeXml(
+    truncate(
+      hasPanePos ? formatTabPane(item) : item.agentName || folderName || 'Reopen',
+      14
+    )
+  );
+  const footerText = escapeXml(
+    truncate(
+      hasPanePos
+        ? [item.agentName, folderName].filter(Boolean).join(' · ') || 'Press to Reopen'
+        : folderName && item.agentName
+          ? `${folderName} · Reopen`
+          : 'Press to Reopen',
+      19
+    )
+  );
 
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144">
   <rect width="144" height="144" rx="20" fill="#131124"/>
   <rect x="4" y="4" width="136" height="136" rx="17" fill="none" stroke="#6366F1" stroke-width="3.5" stroke-dasharray="8 5"/>
   <rect x="14" y="12" width="116" height="24" rx="7" fill="#4338CA"/>
   <circle cx="26" cy="24" r="4.5" fill="#A5B4FC"/>
-  <text x="78" y="29" font-family="Segoe UI, Arial, sans-serif" font-size="12.5" font-weight="800" fill="#EEF2FF" text-anchor="middle">RECENT</text>
-  <text x="72" y="72" font-family="Segoe UI, Arial, sans-serif" font-size="18" font-weight="700" fill="#F8FAFC" text-anchor="middle">${spaceTitle}</text>
-  <text x="72" y="98" font-family="Segoe UI, Arial, sans-serif" font-size="12.5" fill="#A5B4FC" text-anchor="middle">${folderHint}</text>
-  <text x="72" y="124" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#818CF8" text-anchor="middle">Press to Reopen</text>
+  <text x="78" y="29" font-family="Segoe UI, Arial, sans-serif" font-size="12.5" font-weight="800" fill="#EEF2FF" text-anchor="middle">${item.kind === 'pane' ? 'CLOSED PANE' : 'RECENT'}</text>
+  <text x="72" y="70" font-family="Segoe UI, Arial, sans-serif" font-size="18" font-weight="700" fill="#F8FAFC" text-anchor="middle">${spaceTitle}</text>
+  <text x="72" y="97" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#A5B4FC" text-anchor="middle">${middleText}</text>
+  <text x="72" y="124" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#818CF8" text-anchor="middle">${footerText}</text>
 </svg>`;
 
   return toDataUrl(svg);
