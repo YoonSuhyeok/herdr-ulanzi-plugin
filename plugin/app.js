@@ -6,6 +6,7 @@ import UlanziApi from './ulanzi-api.js';
 import {
   renderEmptyIcon,
   renderOfflineIcon,
+  renderRecentSpaceIcon,
   renderSessionIcon,
 } from './svg-renderer.js';
 
@@ -16,6 +17,7 @@ const ACTIVATE_SCRIPT = path.join(__dirname, 'activate-herdr.ps1');
 const PLUGIN_UUID = 'com.herdr.ulanzistudio.sessions';
 const POLL_INTERVAL_MS = 1500;
 const LAYOUT_POLL_INTERVAL_MS = 3000;
+const MAX_RECENT_SPACES = 3;
 
 const STATUS_PRIORITY = {
   blocked: 0,
@@ -27,11 +29,20 @@ const STATUS_PRIORITY = {
 
 const $UD = new UlanziApi();
 
-/** @type {Map<string, { context: string, key: string, active: boolean, lastIcon: string, terminal: object | null }>} */
+/** @type {Map<string, { context: string, key: string, active: boolean, lastIcon: string, terminal: object | null, recentSpace: object | null }>} */
 const slots = new Map();
 
 /** @type {Map<string, { spaceName: string, tabName: string, paneIndex: number, paneTotal: number, app: string | null, name: string | null }>} */
 const layoutByTerminal = new Map();
+
+/** @type {Map<string, { id: string, name: string, folder: string, machine: string | null }>} */
+let lastOpenSpaces = new Map();
+
+/** @type {Array<{ name: string, folder: string, machine: string | null }>} */
+let rememberedClosedSpaces = [];
+
+/** @type {Array<{ name: string, folder: string, machine: string | null }>} */
+let recentSpaces = [];
 
 let pollTimer = null;
 let layoutTimer = null;
@@ -89,6 +100,57 @@ function normalizeTerminal(t) {
   };
 }
 
+function spaceKey(space) {
+  return `${space.machine || 'local'}::${space.folder || space.name || ''}`;
+}
+
+function updateRecentSpaces(data) {
+  const currentOpen = new Map();
+  const openKeys = new Set();
+
+  for (const space of data.spaces || []) {
+    const entry = {
+      id: space.id || '',
+      name: space.name || '',
+      folder: space.folder || '',
+      machine: space.machine || null,
+    };
+    if (entry.id) currentOpen.set(entry.id, entry);
+    openKeys.add(spaceKey(entry));
+  }
+
+  for (const [id, prev] of lastOpenSpaces.entries()) {
+    if (!currentOpen.has(id) && (prev.folder || prev.name)) {
+      const key = spaceKey(prev);
+      rememberedClosedSpaces = [
+        { name: prev.name, folder: prev.folder, machine: prev.machine },
+        ...rememberedClosedSpaces.filter((s) => spaceKey(s) !== key),
+      ].slice(0, 6);
+    }
+  }
+  lastOpenSpaces = currentOpen;
+
+  const combined = [];
+  const seen = new Set(openKeys);
+
+  for (const item of [...rememberedClosedSpaces, ...(Array.isArray(data.recent) ? data.recent : [])]) {
+    if (!item || typeof item !== 'object') continue;
+    const candidate = {
+      name: item.name || (item.folder ? path.basename(item.folder) : ''),
+      folder: item.folder || '',
+      machine: item.machine || null,
+    };
+    if (!candidate.name && !candidate.folder) continue;
+    const key = spaceKey(candidate);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    combined.push(candidate);
+    if (combined.length >= MAX_RECENT_SPACES) break;
+  }
+
+  recentSpaces = combined;
+}
+
 async function refreshLayout() {
   if (isPollingLayout || slots.size === 0) return;
   isPollingLayout = true;
@@ -128,6 +190,8 @@ async function refreshLayout() {
     for (const [k, v] of nextMap.entries()) {
       layoutByTerminal.set(k, v);
     }
+
+    updateRecentSpaces(data);
   } catch {
     // herdr-app window might be closed; keep existing or fallback to hc where
   } finally {
@@ -182,14 +246,28 @@ async function refreshAllSlots() {
 
     ordered.forEach((slot, index) => {
       const terminal = terminals[index] || null;
-      slot.terminal = terminal;
-      const icon = terminal ? renderSessionIcon(terminal) : renderEmptyIcon(index + 1);
+      if (terminal) {
+        slot.terminal = terminal;
+        slot.recentSpace = null;
+        updateSlotIcon(slot, renderSessionIcon(terminal));
+        return;
+      }
+
+      const recentIdx = index - terminals.length;
+      const recentSpace = recentSpaces[recentIdx] || null;
+      slot.terminal = null;
+      slot.recentSpace = recentSpace;
+
+      const icon = recentSpace
+        ? renderRecentSpaceIcon(recentSpace)
+        : renderEmptyIcon(index + 1);
       updateSlotIcon(slot, icon);
     });
   } catch {
     const offlineIcon = renderOfflineIcon();
     for (const slot of slots.values()) {
       slot.terminal = null;
+      slot.recentSpace = null;
       updateSlotIcon(slot, offlineIcon);
     }
   } finally {
@@ -220,6 +298,17 @@ function stopPollingIfEmpty() {
   }
 }
 
+async function activateHerdrWindow() {
+  await execFileAsync(
+    'powershell.exe',
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ACTIVATE_SCRIPT],
+    {
+      timeout: 3000,
+      windowsHide: true,
+    }
+  );
+}
+
 async function focusTerminal(terminal) {
   try {
     await execFileAsync(
@@ -230,16 +319,46 @@ async function focusTerminal(terminal) {
         windowsHide: true,
       }
     );
-    await execFileAsync(
-      'powershell.exe',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ACTIVATE_SCRIPT],
-      {
-        timeout: 3000,
-        windowsHide: true,
-      }
-    );
+    await activateHerdrWindow();
   } catch (err) {
     $UD.toast(`Focus failed (${terminal.id}): ${err.message}`);
+  }
+}
+
+async function reopenSpace(space) {
+  try {
+    const args = ['do', 'space.new'];
+    if (space.name) args.push('--name', space.name);
+    if (space.folder) args.push('--folder', space.folder);
+    if (space.machine) args.push('--machine', space.machine);
+
+    await execFileAsync('herdr-app', args, {
+      timeout: 4000,
+      windowsHide: true,
+    });
+    await activateHerdrWindow();
+    await refreshLayout();
+    await refreshAllSlots();
+  } catch (err) {
+    $UD.toast(`Reopen failed: ${err.message}`);
+  }
+}
+
+async function openNewTab() {
+  try {
+    await execFileAsync('herdr-app', ['do', 'tab.new'], {
+      timeout: 3000,
+      windowsHide: true,
+    });
+    await activateHerdrWindow();
+    await refreshLayout();
+    await refreshAllSlots();
+  } catch (err) {
+    try {
+      await activateHerdrWindow();
+    } catch {
+      $UD.toast(`New tab failed: ${err.message}`);
+    }
   }
 }
 
@@ -258,6 +377,7 @@ $UD.on('add', (jsn) => {
       active: true,
       lastIcon: '',
       terminal: null,
+      recentSpace: null,
     });
   }
   ensurePolling();
@@ -284,8 +404,10 @@ $UD.on('run', (jsn) => {
 
   if (slot.terminal?.id) {
     focusTerminal(slot.terminal);
+  } else if (slot.recentSpace) {
+    reopenSpace(slot.recentSpace);
   } else {
-    $UD.toast('No active Herdr session in this slot');
+    openNewTab();
   }
 });
 
