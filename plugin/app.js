@@ -43,6 +43,15 @@ const STATUS_PRIORITY = {
   error: 3,
   idle: 4,
 };
+// Done sessions already pressed once sort after errors, just before idle.
+const SEEN_DONE_PRIORITY = 3.5;
+
+/**
+ * Terminal ids whose current "done" has been looked at (key pressed).
+ * Cleared as soon as the terminal leaves "done", so the next finish shows fresh.
+ * @type {Set<string>}
+ */
+const seenDoneTerminals = new Set();
 
 const $UD = new UlanziApi();
 
@@ -385,13 +394,24 @@ async function fetchTerminals() {
       ? parsed.terminals
       : [];
 
-  const live = list
+  const normalized = list
     .filter((t) => String(t.state || '').toLowerCase() !== 'finished')
     .map(normalizeTerminal)
-    .filter((t) => Boolean(t.id))
+    .filter((t) => Boolean(t.id));
+
+  const doneIds = new Set(normalized.filter((t) => t.status === 'done').map((t) => t.id));
+  for (const id of seenDoneTerminals) {
+    if (!doneIds.has(id)) seenDoneTerminals.delete(id);
+  }
+
+  const priorityOf = (t) =>
+    t.seen ? SEEN_DONE_PRIORITY : STATUS_PRIORITY[t.status] ?? 99;
+
+  const live = normalized
+    .map((t) => (t.status === 'done' && seenDoneTerminals.has(t.id) ? { ...t, seen: true } : t))
     .sort((a, b) => {
-      const pa = STATUS_PRIORITY[a.status] ?? 99;
-      const pb = STATUS_PRIORITY[b.status] ?? 99;
+      const pa = priorityOf(a);
+      const pb = priorityOf(b);
       if (pa !== pb) return pa - pb;
       return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
     });
@@ -405,10 +425,19 @@ async function fetchTerminals() {
   return live;
 }
 
+// Ulanzi keys are "col_row" (e.g. "3_1"); order row-first so priority reads left→right, top→bottom.
+function parseKeyPosition(key) {
+  const match = /^(\d+)_(\d+)$/.exec(String(key));
+  return match ? { col: Number(match[1]), row: Number(match[2]) } : null;
+}
+
 function getOrderedSlots() {
-  return Array.from(slots.values()).sort((a, b) =>
-    String(a.key).localeCompare(String(b.key), undefined, { numeric: true })
-  );
+  return Array.from(slots.values()).sort((a, b) => {
+    const pa = parseKeyPosition(a.key);
+    const pb = parseKeyPosition(b.key);
+    if (pa && pb) return pa.row - pb.row || pa.col - pb.col;
+    return String(a.key).localeCompare(String(b.key), undefined, { numeric: true });
+  });
 }
 
 function updateSlotIcon(slot, iconDataUrl) {
@@ -625,7 +654,10 @@ $UD.on('run', (jsn) => {
   }
 
   if (slot.terminal?.id) {
-    focusTerminal(slot.terminal);
+    if (slot.terminal.status === 'done') {
+      seenDoneTerminals.add(slot.terminal.id);
+    }
+    focusTerminal(slot.terminal).then(refreshAllSlots);
   } else if (slot.recentSpace) {
     reopenSpace(slot.recentSpace);
   } else {
